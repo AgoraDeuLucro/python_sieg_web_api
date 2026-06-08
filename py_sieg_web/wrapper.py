@@ -1,9 +1,19 @@
 import io
+import sys
 from datetime import date, datetime
 
 import openpyxl
 import requests
 from bs4 import BeautifulSoup
+
+
+class SiegWebError(Exception):
+    """Erro do wrapper Sieg Web."""
+
+
+def _raise_sieg_error(message: str) -> None:
+    sys.tracebacklimit = 0
+    raise SiegWebError(message)
 
 
 class auth:
@@ -24,18 +34,21 @@ class auth:
 
     def _obter_campos_login(self) -> dict:
         """GET hub.sieg.com/, extrai os campos hidden do formulário de login."""
-        response = self._session.get(
-            self._HUB_LOGIN_URL,
-            headers=self._DEFAULT_HEADERS,
-        )
-        response.raise_for_status()
+        try:
+            response = self._session.get(
+                self._HUB_LOGIN_URL,
+                headers=self._DEFAULT_HEADERS,
+            )
+            response.raise_for_status()
+        except requests.RequestException:
+            _raise_sieg_error("Não foi possível acessar a página de login do Sieg.")
 
         soup = BeautifulSoup(response.text, "html.parser")
         fields = {}
         for name in ("__VIEWSTATE", "__VIEWSTATEGENERATOR", "__EVENTVALIDATION"):
             field = soup.find("input", {"name": name})
             if field is None or not field.get("value"):
-                raise ValueError(f"Campo de login '{name}' não encontrado na página do Sieg")
+                _raise_sieg_error("Não foi possível acessar a página de login do Sieg.")
             fields[name] = field["value"]
 
         return fields
@@ -50,22 +63,25 @@ class auth:
             "btnSubmit": "Entrar",
         }
 
-        response = self._session.post(
-            self._AUTH_URL,
-            data=data,
-            headers={
-                **self._DEFAULT_HEADERS,
-                "Content-Type": "application/x-www-form-urlencoded",
-            },
-        )
-        response.raise_for_status()
+        try:
+            response = self._session.post(
+                self._AUTH_URL,
+                data=data,
+                headers={
+                    **self._DEFAULT_HEADERS,
+                    "Content-Type": "application/x-www-form-urlencoded",
+                },
+            )
+            response.raise_for_status()
+        except requests.RequestException:
+            _raise_sieg_error("Falha na autenticação. Verifique email e senha.")
 
         self._auth_cookie = (
             response.cookies.get(self._COOKIE_NAME)
             or self._session.cookies.get(self._COOKIE_NAME)
         )
         if not self._auth_cookie:
-            raise Exception("Falha na autenticação: cookie COFRE.AUTH não recebido")
+            _raise_sieg_error("Falha na autenticação. Verifique email e senha.")
 
         self._session.cookies.set(
             self._COOKIE_NAME,
@@ -99,11 +115,9 @@ class auth:
                 self._autenticar()
                 continue
 
-            raise Exception(
-                f"Erro após reautenticação: {response.status_code} — {url}"
-            )
+            _raise_sieg_error("Erro na requisição ao Sieg Web.")
 
-        raise Exception(f"Erro na requisição: {url}")
+        _raise_sieg_error("Erro na requisição ao Sieg Web.")
 
 
 class hub(auth):
@@ -121,6 +135,22 @@ class hub(auth):
         return str(value)
 
     @staticmethod
+    def _serializar_valor(valor):
+        """Converte valores do Excel para tipos JSON-serializáveis."""
+        if isinstance(valor, datetime):
+            if (
+                valor.hour == 0
+                and valor.minute == 0
+                and valor.second == 0
+                and valor.microsecond == 0
+            ):
+                return valor.strftime("%Y-%m-%d")
+            return valor.strftime("%Y-%m-%d %H:%M:%S")
+        if isinstance(valor, date):
+            return valor.strftime("%Y-%m-%d")
+        return valor
+
+    @staticmethod
     def _xlsx_para_json(content: bytes) -> list[dict]:
         """Lê bytes de um arquivo .xlsx e retorna lista de dicts."""
         workbook = openpyxl.load_workbook(io.BytesIO(content), read_only=True, data_only=True)
@@ -136,7 +166,10 @@ class hub(auth):
             for index, header in enumerate(rows[0])
         ]
 
-        return [dict(zip(headers, row)) for row in rows[1:]]
+        return [
+            {header: hub._serializar_valor(valor) for header, valor in zip(headers, row)}
+            for row in rows[1:]
+        ]
 
     def exportar_xmls(
         self,

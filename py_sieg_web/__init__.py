@@ -1,1 +1,1 @@
-from .wrapper import auth, hub
+from .wrapper import SiegWebError, auth, hub
