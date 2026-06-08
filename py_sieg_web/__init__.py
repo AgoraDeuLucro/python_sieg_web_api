@@ -1,1 +1,1 @@
-from .wrapper import auth, produtos, nfe
+from .wrapper import auth, hub

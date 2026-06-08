@@ -1,657 +1,202 @@
-import json
-import threading
-from time import sleep, time
-from datetime import datetime, date
-from collections import deque
+import io
+from datetime import date, datetime
+
+import openpyxl
 import requests
-import base64
-import urllib.parse
+from bs4 import BeautifulSoup
 
 
-class auth():
+class auth:
+    """Autenticação na plataforma web do Sieg via cookie COFRE.AUTH."""
 
-    # Limites oficiais Bling: 3 req/s e 120.000 req/dia por conta
-    _RATE_LIMIT_PER_SECOND = 3
-    _RATE_LIMIT_DAILY = 120_000
+    _HUB_LOGIN_URL = "https://hub.sieg.com/"
+    _AUTH_URL = "https://auth.sieg.com/"
+    _COOKIE_NAME = "COFRE.AUTH"
+    _DEFAULT_HEADERS = {
+        "accept-language": "pt-BR,pt;q=0.7",
+    }
 
-    def __init__(self, access_token="", client_id="", client_secret="", print_error=True):
-        self.access_token = access_token
-        self.client_id = client_id
-        self.client_secret = client_secret
-        self.base_url = "https://api.bling.com.br/Api/v3"
+    def __init__(self, email: str, password: str, print_error: bool = True):
+        self.email = email
+        self.password = password
         self.print_error = print_error
-        # Rate limiter Thread-safe por instância (limite é por conta Bling)
-        self._rl_lock = threading.Lock()
-        self._rl_second_ts: deque = deque()  # timestamps das req. no último segundo
-        self._rl_daily_count = 0
-        self._rl_daily_date = date.today()
+        self._session = requests.Session()
+        self._auth_cookie: str | None = None
 
-    def _rl_acquire(self):
-        """Garante respeito aos limites de 3 req/s e 120k req/dia. Thread-safe."""
-        with self._rl_lock:
-            now = time()
-            today = date.today()
+    def _obter_campos_login(self) -> dict:
+        """GET hub.sieg.com/, extrai os campos hidden do formulário de login."""
+        response = self._session.get(
+            self._HUB_LOGIN_URL,
+            headers=self._DEFAULT_HEADERS,
+        )
+        response.raise_for_status()
 
-            # Reset contador diário se a data mudou
-            if self._rl_daily_date != today:
-                self._rl_daily_count = 0
-                self._rl_daily_date = today
+        soup = BeautifulSoup(response.text, "html.parser")
+        fields = {}
+        for name in ("__VIEWSTATE", "__VIEWSTATEGENERATOR", "__EVENTVALIDATION"):
+            field = soup.find("input", {"name": name})
+            if field is None or not field.get("value"):
+                raise ValueError(f"Campo de login '{name}' não encontrado na página do Sieg")
+            fields[name] = field["value"]
 
-            # Limite diário atingido — não tem sentido continuar esperando
-            if self._rl_daily_count >= self._RATE_LIMIT_DAILY:
-                raise Exception(
-                    f"Limite diário de {self._RATE_LIMIT_DAILY} requisições da API Bling atingido. "
-                    "Tente novamente amanhã."
-                )
+        return fields
 
-            # Remove timestamps com mais de 1s da janela deslizante
-            while self._rl_second_ts and now - self._rl_second_ts[0] > 1.0:
-                self._rl_second_ts.popleft()
-
-            # Se já há 3 req no último segundo, espera o tempo necessário
-            if len(self._rl_second_ts) >= self._RATE_LIMIT_PER_SECOND:
-                wait = 1.0 - (now - self._rl_second_ts[0])
-                if wait > 0:
-                    sleep(wait)
-                now = time()
-                # Limpa novamente após o sleep
-                while self._rl_second_ts and now - self._rl_second_ts[0] > 1.0:
-                    self._rl_second_ts.popleft()
-
-            self._rl_second_ts.append(now)
-            self._rl_daily_count += 1
-
-    def gerar_url_autorizacao(self, state=None):
-        """
-        Gera a URL de autorização para o fluxo OAuth 2.0.
-        
-        Args:
-            state (str, optional): Sequência aleatória de caracteres para CSRF protection
-            
-        Returns:
-            str: URL de autorização
-            
-        Exemplo:
-            url = client.gerar_url_autorizacao("estado_aleatorio_123")
-            # Redirecione o usuário para esta URL
-        """
-        if not self.client_id:
-            raise ValueError("client_id é obrigatório para gerar URL de autorização")
-        
-        params = {
-            'response_type': 'code',
-            'client_id': self.client_id
-        }
-        
-        if state:
-            params['state'] = state
-        
-        query_string = urllib.parse.urlencode(params)
-        return f"https://www.bling.com.br/Api/v3/oauth/authorize?{query_string}"
-
-    def trocar_code_por_tokens(self, authorization_code):
-        """
-        Troca o authorization code pelos tokens de acesso.
-        
-        Args:
-            authorization_code (str): Código de autorização recebido do callback
-            
-        Returns:
-            dict: Dicionário com os tokens ou erro
-            
-        Exemplo:
-            tokens = client.trocar_code_por_tokens("codigo_do_callback")
-            if 'access_token' in tokens:
-                client.access_token = tokens['access_token']
-                client.refresh_token = tokens['refresh_token']
-        """
-        if not self.client_id or not self.client_secret:
-            raise ValueError("client_id e client_secret são obrigatórios")
-
-        # Codificar credenciais em base64
-        credentials = f"{self.client_id}:{self.client_secret}"
-        credentials_b64 = base64.b64encode(credentials.encode()).decode()
-
-        headers = {
-            'Content-Type': 'application/x-www-form-urlencoded',
-            'Accept': '1.0',
-            'Authorization': f'Basic {credentials_b64}'
-        }
-
+    def _autenticar(self) -> None:
+        """Obtém os campos hidden e faz login em auth.sieg.com/."""
+        campos = self._obter_campos_login()
         data = {
-            'grant_type': 'authorization_code',
-            'code': authorization_code
+            **campos,
+            "txtEmail": self.email,
+            "txtPassword": self.password,
+            "btnSubmit": "Entrar",
         }
 
-        try:
-            response = requests.post(
-                'https://api.bling.com.br/Api/v3/oauth/token',
-                headers=headers,
-                data=data
+        response = self._session.post(
+            self._AUTH_URL,
+            data=data,
+            headers={
+                **self._DEFAULT_HEADERS,
+                "Content-Type": "application/x-www-form-urlencoded",
+            },
+        )
+        response.raise_for_status()
+
+        self._auth_cookie = (
+            response.cookies.get(self._COOKIE_NAME)
+            or self._session.cookies.get(self._COOKIE_NAME)
+        )
+        if not self._auth_cookie:
+            raise Exception("Falha na autenticação: cookie COFRE.AUTH não recebido")
+
+        self._session.cookies.set(
+            self._COOKIE_NAME,
+            self._auth_cookie,
+            domain="hub.sieg.com",
+        )
+
+    def _garantir_autenticado(self) -> None:
+        """Autentica apenas quando o cookie ainda não estiver disponível."""
+        if self._auth_cookie is None:
+            self._autenticar()
+
+    def request(self, method: str, url: str, params=None, **kwargs):
+        """Executa requisição autenticada com retry de autenticação (1x)."""
+        self._garantir_autenticado()
+
+        response = None
+        for tentativa in range(2):
+            response = self._session.request(
+                method,
+                url,
+                params=params,
+                headers={**self._DEFAULT_HEADERS, **kwargs.pop("headers", {})},
+                **kwargs,
             )
-
-            if response.status_code == 200:
-                token_data = response.json()
-            
-                return token_data
-            else:
-                error_data = response.json() if response.text else {"error": "Erro desconhecido"}
-                if self.print_error:
-                    print(f"Erro ao obter tokens: {error_data}")
-                return error_data
-                
-        except Exception as e:
-            error = {"error": f"Erro na requisição: {str(e)}"}
-            if self.print_error:
-                print(error['error'])
-            return error
-
-    def renovar_access_token(self, refresh_token=None):
-        """
-        Renova o access token usando o refresh token.
-        
-        Args:
-            refresh_token (str, optional): Refresh token. Usa o armazenado na instância se não fornecido
-            
-        Returns:
-            dict: Dicionário com os novos tokens ou erro
-            
-        Exemplo:
-            novos_tokens = client.renovar_access_token()
-            if 'access_token' in novos_tokens:
-                print("Token renovado com sucesso!")
-        """
-        
-        if not refresh_token:
-            raise ValueError("refresh_token é obrigatório")
-            
-        if not self.client_id or not self.client_secret:
-            raise ValueError("client_id e client_secret são obrigatórios")
-
-        # Codificar credenciais em base64
-        credentials = f"{self.client_id}:{self.client_secret}"
-        credentials_b64 = base64.b64encode(credentials.encode()).decode()
-
-        headers = {
-            'Content-Type': 'application/x-www-form-urlencoded',
-            'Accept': '1.0',
-            'Authorization': f'Basic {credentials_b64}'
-        }
-
-        data = {
-            'grant_type': 'refresh_token',
-            'refresh_token': refresh_token
-        }
-
-        try:
-            response = requests.post(
-                'https://api.bling.com.br/Api/v3/oauth/token',
-                headers=headers,
-                data=data
-            )
-
-            if response.status_code == 200:
-                token_data = response.json()
-                
-                return token_data
-            else:
-                error_data = response.json() if response.text else {"error": "Erro desconhecido"}
-                if self.print_error:
-                    print(f"Erro ao renovar token: {error_data}")
-                return error_data
-                
-        except Exception as e:
-            error = {"error": f"Erro na requisição: {str(e)}"}
-            if self.print_error:
-                print(error['error'])
-            return error
-
-    def revogar_token(self, token=None, token_type="access_token", revoke_action=None, revoke_target="user"):
-        """
-        Revoga um access_token ou refresh_token.
-        
-        Args:
-            token (str, optional): Token para revogar. Usa o access_token da instância se não fornecido
-            token_type (str): Tipo do token ("access_token" ou "refresh_token")
-            revoke_action (str, optional): Tipo de revogação ("logout" ou "uninstall")
-            revoke_target (str): Alvo da revogação ("user" ou "company")
-            
-        Returns:
-            bool: True se revogação foi bem-sucedida, False caso contrário
-            
-        Exemplo:
-            # Revogar apenas o token atual
-            sucesso = client.revogar_token()
-            
-            # Revogar todos os tokens do usuário (logout)
-            sucesso = client.revogar_token(revoke_action="logout")
-            
-            # Desinstalar aplicativo (revoga todos os tokens)
-            sucesso = client.revogar_token(revoke_action="uninstall")
-        """
-        token_para_revogar = token or self.access_token
-        
-        if not token_para_revogar:
-            raise ValueError("token é obrigatório")
-            
-        if not self.client_id or not self.client_secret:
-            raise ValueError("client_id e client_secret são obrigatórios")
-
-        # Codificar credenciais em base64
-        credentials = f"{self.client_id}:{self.client_secret}"
-        credentials_b64 = base64.b64encode(credentials.encode()).decode()
-
-        headers = {
-            'Content-Type': 'application/x-www-form-urlencoded',
-            'Authorization': f'Basic {credentials_b64}'
-        }
-
-        data = {
-            'token': token_para_revogar,
-            'token_type_hint': token_type
-        }
-
-        # Adicionar parâmetros de revogação avançada se fornecidos
-        if revoke_action:
-            data['revoke_action'] = revoke_action
-        if revoke_target:
-            data['revoke_target'] = revoke_target
-
-        try:
-            response = requests.post(
-                'https://api.bling.com.br/oauth/revoke',
-                headers=headers,
-                data=data
-            )
-
-            if response.status_code == 200:
-                return True
-            else:
-                if self.print_error:
-                    error_data = response.json() if response.text else {"error": "Erro desconhecido"}
-                    print(f"Erro ao revogar token: {error_data}")
-                return False
-                
-        except Exception as e:
-            if self.print_error:
-                print(f"Erro na requisição de revogação: {str(e)}")
-            return False
-
-    def request(self, method="GET", url="", headers=None, params=None, data=None):
-
-        req_params = params if params != None else {}
-        req_headers = headers if headers != None else {}
-        req_data = data if data != None else {}
-
-        # Usar formato Bearer para OAuth tokens
-        if self.access_token != "" and self.access_token != None:
-            if self.access_token.startswith('Bearer '):
-                req_headers['Authorization'] = self.access_token
-            else:
-                req_headers['Authorization'] = f'Bearer {self.access_token}'
-
-        while True:
-            self._rl_acquire()
-
-            match method:
-                case "GET":
-                    response = requests.get(url=url, params=req_params, headers=req_headers, data=req_data)
-                case "PUT":
-                    response = requests.put(url=url, params=req_params, headers=req_headers, data=req_data)
-                case "POST":
-                    response = requests.post(url=url, params=req_params, headers=req_headers, data=req_data)
-                case "DELETE":
-                    response = requests.delete(url=url, params=req_params, headers=req_headers, data=req_data)
-                case "HEAD":
-                    response = requests.head(url=url, params=req_params, headers=req_headers, data=req_data)
-                case "OPTIONS":
-                    response = requests.options(url=url, params=req_params, headers=req_headers, data=req_data)
-
-            if response.status_code == 200 or response.status_code == 201:
+            if response.ok:
                 return response
-            elif response.status_code == 429:
-                # Distingue limite por segundo (recuperável) de limite diário (fatal)
-                try:
-                    period = response.json().get("error", {}).get("period", "second")
-                except Exception:
-                    period = "second"
-                if period == "day":
-                    raise Exception(
-                        f"Limite diário de {self._RATE_LIMIT_DAILY} requisições da API Bling atingido. "
-                        "Tente novamente amanhã."
-                    )
-                # Limite por segundo: aguarda 1s e retenta (o _rl_acquire fará o ajuste fino)
-                sleep(1)
-            else:
-                if self.print_error:
-                    try:
-                        response_json = response.json()
-                        message = response_json['message'] if 'message' in response_json else ""
-                        json_content = response_json
-                    except:
-                        message = ""
-                        json_content = response.text
-                    
-                    print(f"""Erro no retorno da API do Bling
-Mensagem: {message}
-URL: {url}
-Metodo: {method}
-Parametros: {req_params}
-Headers: {req_headers}
-Data: {req_data}
-Resposta JSON: {json_content}""")
-                if response.status_code == 403 or response.status_code == 404:
-                    return None
-                else:
-                    break
 
-class produtos(auth):
+            if tentativa == 0:
+                self._auth_cookie = None
+                self._autenticar()
+                continue
 
-    def ver_produtos(self, all_pages=True, page=1, limite=100, **kwargs):
-        """
-        Buscar produtos cadastrados.
-        
-        Args:
-            all_pages (bool): Se True, busca todas as páginas automaticamente (padrão: True)
-            page (int): Número da página para retornar (padrão: 1)
-            limite (int): Quantidade de registros por página (máximo: 100, padrão: 100)
-            **kwargs: Parâmetros opcionais de filtro como:
-                - criterio: Critério de ordenação (id, nome, codigo, preco, etc.)
-                - tipo: Tipo de ordenação (ASC ou DESC)
-                - dataInclusao: Data de inclusão (formato: YYYY-MM-DD)
-                - dataAlteracao: Data de alteração (formato: YYYY-MM-DD)
-                - codigo: Código do produto
-                - nome: Nome do produto (busca parcial)
-                - situacao: Situação do produto (Ativo, Inativo)
-                - formato: Formato do produto (S - Simples, V - com Variações, E - com Composição)
-                - tipo_produto: Tipo do produto (P - Produto, S - Serviço)
-                - categoria: ID da categoria
-                - estoque_minimo: Filtro por estoque mínimo
-                - estoque_maximo: Filtro por estoque máximo
-                
-        Returns:
-            dict: Dados dos produtos ou dict vazio se falhou
-            
-        Documentação: https://developer.bling.com.br/referencia#/Produtos/get_produtos
-        """
-        
-        asct = True  # Acesso Só Com Token
+            if self.print_error:
+                print(
+                    f"Erro no retorno da API do Sieg Web\n"
+                    f"Status: {response.status_code}\n"
+                    f"URL: {url}\n"
+                    f"Método: {method}\n"
+                    f"Parâmetros: {params}\n"
+                    f"Resposta: {response.text[:500]}"
+                )
+            raise Exception(
+                f"Erro após reautenticação: {response.status_code} — {url}"
+            )
 
-        if asct and (self.access_token == "" or self.access_token == None or type(self.access_token) != str):
-            print("Token inválido")
-            return {}
-
-        url = self.base_url + "/produtos"
-
-        params = {
-            'pagina': page,
-            'limite': limite
-        }
-
-        # Adicionar parâmetros opcionais de filtro
-        if kwargs:
-            for key, value in kwargs.items():
-                params[key] = value
-
-        response = self.request("GET", url=url, params=params)
-
-        if response:
-            if all_pages:
-                json_response = response.json()
-                
-                # Verificar se existe a estrutura de dados esperada
-                if 'data' not in json_response:
-                    return json_response
-                
-                produtos_list = json_response['data']
-                
-                # Continuar buscando páginas enquanto houver dados
-                while len(json_response['data']) == limite:  # Se retornou a quantidade máxima, pode haver mais páginas
-                    page += 1
-                    params['pagina'] = page
-                    response2 = self.request("GET", url=url, params=params)
-
-                    if response2:
-                        json_response2 = response2.json()
-                        if 'data' in json_response2 and json_response2['data']:
-                            produtos_list.extend(json_response2['data'])
-                            json_response = json_response2
-                        else:
-                            break
-                    else:
-                        break
-
-                # Atualizar a resposta final com todos os produtos
-                json_response['data'] = produtos_list
-                return json_response
-            else:
-                return response.json()
-        else:
-            return {}
-    
-    def ver_produto(self, id_produto):
-        """
-        Buscar produto por ID.
-        
-        Args:
-            id_produto (int): ID do produto no Bling
-            
-        Returns:
-            dict: Dados do produto ou dict vazio se falhou
-            
-        Documentação: https://developer.bling.com.br/referencia#/Produtos/get_produtos__idProduto_
-        """
-        
-        asct = True  # Acesso Só Com Token
-
-        if asct and (self.access_token == "" or self.access_token == None or type(self.access_token) != str):
-            print("Token inválido")
-            return {}
-
-        url = self.base_url + f"/produtos/{id_produto}"
-
-        response = self.request("GET", url=url)
-
-        if response:
-            return response.json()
-        else:
-            return {}
-    
-    def criar_produto(self, nome, codigo, **kwargs):
-        """
-        Criar um novo produto.
-        
-        Args:
-            nome (str): Nome do produto
-            codigo (str): Código do produto
-            **kwargs: Dados opcionais do produto como:
-                - descricao: Descrição do produto
-                - unidade: Unidade de medida
-                - preco: Preço do produto
-                - tipo: Tipo do produto (P - Produto, S - Serviço)
-                - situacao: Situação (A - Ativo, I - Inativo)
-                - formato: Formato (S - Simples, V - com Variações, E - com Composição)
-                - categoria: Dados da categoria
-                - estoque: Dados de estoque
-                - actionEstoque: Ação do estoque (S - Subtrair, N - Não subtrair)
-                - dimensoes: Dimensões do produto
-                - tributacao: Dados de tributação
-                - midia: Mídias do produto
-                
-        Returns:
-            dict: Dados do produto criado ou dict vazio se falhou
-            
-        Documentação: https://developer.bling.com.br/referencia#/Produtos/post_produtos
-        """
-        
-        asct = True  # Acesso Só Com Token
-
-        if asct and (self.access_token == "" or self.access_token == None or type(self.access_token) != str):
-            print("Token inválido")
-            return {}
-
-        url = self.base_url + "/produtos"
-        
-        # Dados obrigatórios
-        data = {
-            "nome": nome,
-            "codigo": codigo
-        }
-        
-        # Adicionar parâmetros opcionais
-        if kwargs:
-            for key, value in kwargs.items():
-                data[key] = value
-
-        response = self.request("POST", url=url, data=json.dumps(data), headers={"Content-Type": "application/json"})
-
-        if response:
-            return response.json()
-        else:
-            return {}
-    
-    def editar_produto(self, id_produto, **kwargs):
-        """
-        Atualizar um produto existente.
-        
-        Args:
-            id_produto (int): ID do produto no Bling
-            **kwargs: Campos para atualizar como nome, codigo, descricao, preco, etc.
-            
-        Returns:
-            dict: Dados do produto atualizado ou dict vazio se falhou
-            
-        Documentação: https://developer.bling.com.br/referencia#/Produtos/put_produtos__idProduto_
-        """
-        
-        asct = True  # Acesso Só Com Token
-
-        if asct and (self.access_token == "" or self.access_token == None or type(self.access_token) != str):
-            print("Token inválido")
-            return {}
-
-        url = self.base_url + f"/produtos/{id_produto}"
-        
-        # Montar dados para atualização
-        data = {}
-        if kwargs:
-            for key, value in kwargs.items():
-                data[key] = value
-
-        response = self.request("PUT", url=url, data=json.dumps(data), headers={"Content-Type": "application/json"})
-
-        if response:
-            return response.json()
-        else:
-            return {}
-    
-    def deletar_produto(self, id_produto):
-        """
-        Excluir um produto.
-        
-        Args:
-            id_produto (int): ID do produto no Bling
-            
-        Returns:
-            dict: Resposta de sucesso ou dict vazio se falhou
-            
-        Documentação: https://developer.bling.com.br/referencia#/Produtos/delete_produtos__idProduto_
-        """
-        
-        asct = True  # Acesso Só Com Token
-
-        if asct and (self.access_token == "" or self.access_token == None or type(self.access_token) != str):
-            print("Token inválido")
-            return {}
-
-        url = self.base_url + f"/produtos/{id_produto}"
-
-        response = self.request("DELETE", url=url)
-
-        if response:
-            return response.json()
-        else:
-            return {}
+        raise Exception(f"Erro na requisição: {url}")
 
 
-class nfe(auth):
-    """Operações de Nota Fiscal Eletrônica (NF-e) na API Bling v3.
+class hub(auth):
+    """Operações do Hub Sieg Web."""
 
-    Limites respeitados automaticamente pelo rate limiter da classe auth:
-    - 3 requisições por segundo por conta
-    - 120.000 requisições por dia por conta
-    """
+    _BASE_URL = "https://hub.sieg.com/Handler/HubInfo.ashx"
 
-    _SITUACOES_COM_XML = {2, 5, 6, 9}  # Cancelada, Autorizada, Emitida DANFE, Denegada
+    @staticmethod
+    def _fmt_date(value: str | date | datetime) -> str:
+        """Converte data para o formato DD/MM/YYYY esperado pelo Sieg."""
+        if isinstance(value, datetime):
+            return value.strftime("%d/%m/%Y")
+        if isinstance(value, date):
+            return value.strftime("%d/%m/%Y")
+        return str(value)
 
-    def listar(self, date_start, date_end, tipo=1, all_pages=True, limite=100, **kwargs):
-        """Lista NF-e no período informado.
+    @staticmethod
+    def _xlsx_para_json(content: bytes) -> list[dict]:
+        """Lê bytes de um arquivo .xlsx e retorna lista de dicts."""
+        workbook = openpyxl.load_workbook(io.BytesIO(content), read_only=True, data_only=True)
+        worksheet = workbook.active
+        rows = list(worksheet.iter_rows(values_only=True))
+        workbook.close()
 
-        Args:
-            date_start (date | str): Data inicial (YYYY-MM-DD ou objeto date).
-            date_end   (date | str): Data final   (YYYY-MM-DD ou objeto date).
-            tipo       (int):  1=Saída (padrão), 2=Entrada.
-            all_pages  (bool): Se True percorre todas as páginas automaticamente.
-            limite     (int):  Registros por página (máx. 100).
-            **kwargs:  Parâmetros extras repassados à query string (ex.: situacao=5).
-
-        Returns:
-            list[dict]: Lista de resumos de NF-e.
-        """
-        if not self.access_token:
-            print("Token inválido")
+        if not rows:
             return []
 
-        # Aceita tanto datetime.date quanto string YYYY-MM-DD
-        fmt = lambda d: d.strftime("%Y-%m-%d") if hasattr(d, "strftime") else str(d)
+        headers = [
+            str(header) if header is not None else f"col_{index}"
+            for index, header in enumerate(rows[0])
+        ]
 
-        url = self.base_url + "/nfe"
-        page = 1
-        results = []
+        return [dict(zip(headers, row)) for row in rows[1:]]
 
-        while True:
-            params = {
-                "pagina": page,
-                "limite": limite,
-                "tipo": tipo,
-                "dataEmissaoInicial": fmt(date_start),
-                "dataEmissaoFinal": fmt(date_end),
-            }
-            params.update(kwargs)
-
-            response = self.request("GET", url=url, params=params)
-            if not response:
-                break
-
-            body = response.json()
-            data = body.get("data", [])
-            if data:
-                results.extend(data)
-
-            if not all_pages or len(data) < limite:
-                break
-            page += 1
-
-        return results
-
-    def obter(self, nfe_id):
-        """Retorna os detalhes completos de uma NF-e, incluindo a URL do XML.
+    def exportar_xmls(
+        self,
+        dashboard_id: str,
+        cnpj: str,
+        date_start: str | date | datetime,
+        date_end: str | date | datetime,
+        cnpj_emit: str = "",
+        cnpj_dest: str = "",
+        cnpj_rem: str = "",
+        cnpj_tom: str = "",
+        xml_type: int = 99,
+        number_xml: int = 0,
+    ) -> list[dict]:
+        """
+        Exporta XMLs do Hub Sieg e retorna o relatório Excel como JSON.
 
         Args:
-            nfe_id (int | str): ID da NF-e no Bling.
+            dashboard_id: ID do dashboard (ex.: "15490-32946452000157").
+            cnpj: CNPJ do certificado (ex.: "32946452000157").
+            date_start: Data inicial de emissão (DD/MM/YYYY ou date/datetime).
+            date_end: Data final de emissão (DD/MM/YYYY ou date/datetime).
+            cnpj_emit: Filtro opcional de CNPJ emitente.
+            cnpj_dest: Filtro opcional de CNPJ destinatário.
+            cnpj_rem: Filtro opcional de CNPJ remetente.
+            cnpj_tom: Filtro opcional de CNPJ tomador.
+            xml_type: Tipo de XML (padrão: 99).
+            number_xml: Número do XML (padrão: 0).
 
         Returns:
-            dict: Dados completos da NF-e (campo ``data`` da resposta).
-                  Contém ``xml`` com a URL para download do arquivo XML.
-                  Retorna {} em caso de erro.
+            list[dict]: Linhas da planilha como dicionários.
         """
-        if not self.access_token:
-            print("Token inválido")
-            return {}
+        params = {
+            "action": "exportXmlDownloadExcel",
+            "dashboardId": dashboard_id,
+            "dateStartEmissionStr": self._fmt_date(date_start),
+            "dateEndEmissionStr": self._fmt_date(date_end),
+            "xmlKey": "",
+            "xmlType": xml_type,
+            "typeDownload": "",
+            "cnpjEmit": cnpj_emit,
+            "cnpjDest": cnpj_dest,
+            "cnpjRem": cnpj_rem,
+            "cnpjTom": cnpj_tom,
+            "numberXml": number_xml,
+            "dateDownloadInitStr": "",
+            "dateDownloadFimStr": "",
+            "certificateId": dashboard_id,
+            "cnpjCertificate": cnpj,
+        }
 
-        url = self.base_url + f"/nfe/{nfe_id}"
-        response = self.request("GET", url=url)
-
-        if response:
-            return response.json().get("data", {})
-        return {}
+        response = self.request("GET", self._BASE_URL, params=params)
+        return self._xlsx_para_json(response.content)
