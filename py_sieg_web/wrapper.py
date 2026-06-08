@@ -16,10 +16,9 @@ class auth:
         "accept-language": "pt-BR,pt;q=0.7",
     }
 
-    def __init__(self, email: str, password: str, print_error: bool = True):
+    def __init__(self, email: str, password: str):
         self.email = email
         self.password = password
-        self.print_error = print_error
         self._session = requests.Session()
         self._auth_cookie: str | None = None
 
@@ -100,15 +99,6 @@ class auth:
                 self._autenticar()
                 continue
 
-            if self.print_error:
-                print(
-                    f"Erro no retorno da API do Sieg Web\n"
-                    f"Status: {response.status_code}\n"
-                    f"URL: {url}\n"
-                    f"Método: {method}\n"
-                    f"Parâmetros: {params}\n"
-                    f"Resposta: {response.text[:500]}"
-                )
             raise Exception(
                 f"Erro após reautenticação: {response.status_code} — {url}"
             )
